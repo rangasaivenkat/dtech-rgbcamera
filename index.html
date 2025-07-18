@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Video Stream Client</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: white;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            padding: 30px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+        
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+        
+        button {
+            background: linear-gradient(45deg, #ff6b6b, #ee5a24);
+            color: white;
+            border: none;
+            padding: 12px 25px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+        }
+        
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .video-container {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 30px;
+        }
+        
+        #remoteVideo {
+            max-width: 100%;
+            max-height: 70vh;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            background: #000;
+        }
+        
+        .status {
+            text-align: center;
+            margin-bottom: 20px;
+            padding: 15px;
+            border-radius: 10px;
+            font-weight: 600;
+            font-size: 18px;
+        }
+        
+        .status.connected {
+            background: rgba(46, 204, 113, 0.3);
+            border: 1px solid #2ecc71;
+        }
+        
+        .status.connecting {
+            background: rgba(241, 196, 15, 0.3);
+            border: 1px solid #f1c40f;
+        }
+        
+        .status.disconnected {
+            background: rgba(231, 76, 60, 0.3);
+            border: 1px solid #e74c3c;
+        }
+        
+        .logs {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 20px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .log-entry {
+            margin-bottom: 8px;
+            padding: 5px;
+            border-radius: 5px;
+        }
+        
+        .log-info {
+            background: rgba(52, 152, 219, 0.2);
+        }
+        
+        .log-error {
+            background: rgba(231, 76, 60, 0.2);
+        }
+        
+        .log-warning {
+            background: rgba(241, 196, 15, 0.2);
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #3498db;
+        }
+        
+        .stat-label {
+            font-size: 0.9em;
+            opacity: 0.8;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎥 WebRTC Video Stream Client</h1>
+        
+        <div class="controls">
+            <button id="connectBtn">Connect to Stream</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+            <button id="fullscreenBtn" disabled>Fullscreen</button>
+        </div>
+        
+        <div id="status" class="status disconnected">
+            Disconnected - Click Connect to start streaming
+        </div>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div id="connectionState" class="stat-value">Closed</div>
+                <div class="stat-label">Connection State</div>
+            </div>
+            <div class="stat-card">
+                <div id="iceState" class="stat-value">New</div>
+                <div class="stat-label">ICE State</div>
+            </div>
+            <div class="stat-card">
+                <div id="videoResolution" class="stat-value">N/A</div>
+                <div class="stat-label">Video Resolution</div>
+            </div>
+        </div>
+        
+        <div class="video-container">
+            <video id="remoteVideo" autoplay playsinline muted></video>
+        </div>
+        
+        <div class="logs" id="logs"></div>
+    </div>
+
+    <script>
+        class WebRTCClient {
+            constructor() {
+                this.websocket = null;
+                this.peerConnection = null;
+                this.peerId = 'browser-client-' + Math.random().toString(36).substr(2, 9);
+                this.signalingServerUrl = 'wss://websockettest-eggy.onrender.com';
+                this.isConnected = false;
+                
+                this.initializeElements();
+                this.setupEventListeners();
+            }
+            
+            initializeElements() {
+                this.connectBtn = document.getElementById('connectBtn');
+                this.disconnectBtn = document.getElementById('disconnectBtn');
+                this.fullscreenBtn = document.getElementById('fullscreenBtn');
+                this.statusDiv = document.getElementById('status');
+                this.remoteVideo = document.getElementById('remoteVideo');
+                this.logsDiv = document.getElementById('logs');
+                this.connectionStateDiv = document.getElementById('connectionState');
+                this.iceStateDiv = document.getElementById('iceState');
+                this.videoResolutionDiv = document.getElementById('videoResolution');
+            }
+            
+            setupEventListeners() {
+                this.connectBtn.addEventListener('click', () => this.connect());
+                this.disconnectBtn.addEventListener('click', () => this.disconnect());
+                this.fullscreenBtn.addEventListener('click', () => this.toggleFullscreen());
+                
+                this.remoteVideo.addEventListener('loadedmetadata', () => {
+                    const width = this.remoteVideo.videoWidth;
+                    const height = this.remoteVideo.videoHeight;
+                    this.videoResolutionDiv.textContent = `${width}x${height}`;
+                });
+            }
+            
+            log(message, type = 'info') {
+                const timestamp = new Date().toLocaleTimeString();
+                const logEntry = document.createElement('div');
+                logEntry.className = `log-entry log-${type}`;
+                logEntry.textContent = `[${timestamp}] ${message}`;
+                this.logsDiv.appendChild(logEntry);
+                this.logsDiv.scrollTop = this.logsDiv.scrollHeight;
+                
+                console.log(`[${type.toUpperCase()}] ${message}`);
+            }
+            
+            updateStatus(message, className) {
+                this.statusDiv.textContent = message;
+                this.statusDiv.className = `status ${className}`;
+            }
+            
+            async connect() {
+                try {
+                    this.log('Connecting to signaling server...');
+                    this.updateStatus('Connecting to signaling server...', 'connecting');
+                    
+                    this.websocket = new WebSocket(this.signalingServerUrl);
+                    
+                    this.websocket.onopen = () => {
+                        this.log('Connected to signaling server');
+                        this.registerWithServer();
+                    };
+                    
+                    this.websocket.onmessage = (event) => {
+                        this.handleSignalingMessage(event.data);
+                    };
+                    
+                    this.websocket.onclose = (event) => {
+                        this.log(`WebSocket closed: ${event.code} - ${event.reason}`, 'warning');
+                        this.handleDisconnection();
+                    };
+                    
+                    this.websocket.onerror = (error) => {
+                        this.log('WebSocket error occurred', 'error');
+                        this.handleDisconnection();
+                    };
+                    
+                } catch (error) {
+                    this.log(`Connection failed: ${error.message}`, 'error');
+                    this.handleDisconnection();
+                }
+            }
+            
+            registerWithServer() {
+                const registerMessage = {
+                    type: 'register',
+                    peer_id: this.peerId
+                };
+                
+                this.websocket.send(JSON.stringify(registerMessage));
+                this.log(`Registered with peer ID: ${this.peerId}`);
+                
+                // After registration, create peer connection and send offer
+                this.createPeerConnection();
+                this.createOffer();
+            }
+            
+            createPeerConnection() {
+                const configuration = {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                };
+                
+                this.peerConnection = new RTCPeerConnection(configuration);
+                
+                this.peerConnection.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        this.sendIceCandidate(event.candidate);
+                    }
+                };
+                
+                this.peerConnection.ontrack = (event) => {
+                    this.log('Received remote track');
+                    this.remoteVideo.srcObject = event.streams[0];
+                    this.fullscreenBtn.disabled = false;
+                };
+                
+                this.peerConnection.onconnectionstatechange = () => {
+                    const state = this.peerConnection.connectionState;
+                    this.connectionStateDiv.textContent = state;
+                    this.log(`Connection state: ${state}`);
+                    
+                    if (state === 'connected') {
+                        this.updateStatus('Connected - Receiving video stream', 'connected');
+                        this.isConnected = true;
+                        this.connectBtn.disabled = true;
+                        this.disconnectBtn.disabled = false;
+                    } else if (state === 'disconnected' || state === 'failed') {
+                        this.handleDisconnection();
+                    }
+                };
+                
+                this.peerConnection.oniceconnectionstatechange = () => {
+                    const state = this.peerConnection.iceConnectionState;
+                    this.iceStateDiv.textContent = state;
+                    this.log(`ICE connection state: ${state}`);
+                };
+                
+                this.log('Peer connection created');
+            }
+            
+            async createOffer() {
+                try {
+                    // Add a transceiver to receive video from the Python server
+                    this.peerConnection.addTransceiver('video', {
+                        direction: 'recvonly'
+                    });
+                    
+                    const offer = await this.peerConnection.createOffer();
+                    await this.peerConnection.setLocalDescription(offer);
+                    
+                    this.log('Created offer with SDP length: ' + offer.sdp.length);
+                    
+                    const offerMessage = {
+                        SessionType: 'Offer',
+                        Sdp: offer.sdp
+                    };
+                    
+                    this.websocket.send('OFFER!' + JSON.stringify(offerMessage));
+                    this.log('Sent offer to Python server');
+                    
+                } catch (error) {
+                    this.log(`Failed to create offer: ${error.message}`, 'error');
+                }
+            }
+            
+            sendIceCandidate(candidate) {
+                const candidateMessage = {
+                    SdpMid: candidate.sdpMid,
+                    SdpMLineIndex: candidate.sdpMLineIndex,
+                    Candidate: candidate.candidate
+                };
+                
+                this.websocket.send('CANDIDATE!' + JSON.stringify(candidateMessage));
+                this.log('Sent ICE candidate');
+            }
+            
+            async handleSignalingMessage(message) {
+                this.log(`Received message: ${message.substring(0, 50)}...`);
+                
+                if (message.startsWith('ANSWER!')) {
+                    const jsonStr = message.substring(7);
+                    try {
+                        const data = JSON.parse(jsonStr);
+                        const answer = new RTCSessionDescription({
+                            type: 'answer',
+                            sdp: data.Sdp
+                        });
+                        
+                        await this.peerConnection.setRemoteDescription(answer);
+                        this.log('Set remote description (answer)');
+                        
+                    } catch (error) {
+                        this.log(`Failed to handle answer: ${error.message}`, 'error');
+                    }
+                    
+                } else if (message.startsWith('CANDIDATE!')) {
+                    const jsonStr = message.substring(10);
+                    try {
+                        const data = JSON.parse(jsonStr);
+                        const candidate = new RTCIceCandidate({
+                            sdpMid: data.SdpMid,
+                            sdpMLineIndex: data.SdpMLineIndex,
+                            candidate: data.Candidate
+                        });
+                        
+                        await this.peerConnection.addIceCandidate(candidate);
+                        this.log('Added ICE candidate');
+                        
+                    } catch (error) {
+                        this.log(`Failed to handle ICE candidate: ${error.message}`, 'error');
+                    }
+                }
+            }
+            
+            disconnect() {
+                this.log('Disconnecting...');
+                
+                if (this.peerConnection) {
+                    this.peerConnection.close();
+                    this.peerConnection = null;
+                }
+                
+                if (this.websocket) {
+                    this.websocket.close();
+                    this.websocket = null;
+                }
+                
+                this.handleDisconnection();
+            }
+            
+            handleDisconnection() {
+                this.isConnected = false;
+                this.connectBtn.disabled = false;
+                this.disconnectBtn.disabled = true;
+                this.fullscreenBtn.disabled = true;
+                
+                this.updateStatus('Disconnected - Click Connect to start streaming', 'disconnected');
+                this.connectionStateDiv.textContent = 'Closed';
+                this.iceStateDiv.textContent = 'Closed';
+                this.videoResolutionDiv.textContent = 'N/A';
+                
+                if (this.remoteVideo.srcObject) {
+                    this.remoteVideo.srcObject = null;
+                }
+                
+                this.log('Disconnected from stream');
+            }
+            
+            toggleFullscreen() {
+                if (!document.fullscreenElement) {
+                    this.remoteVideo.requestFullscreen().catch(err => {
+                        this.log(`Error attempting to enable fullscreen: ${err.message}`, 'error');
+                    });
+                } else {
+                    document.exitFullscreen();
+                }
+            }
+        }
+        
+        // Initialize the client when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            new WebRTCClient();
+        });
+    </script>
+</body>
+</html>
