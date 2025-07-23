@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Python WebRTC Stream</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        h1 {
+            color: #333;
+        }
+        #video-container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            background-color: #000;
+            border: 1px solid #ccc;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+        #controls {
+            margin-top: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        #connectButton {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+            background-color: #007aff;
+            color: white;
+            transition: background-color 0.3s;
+        }
+        #connectButton:disabled {
+            background-color: #a0a0a0;
+            cursor: not-allowed;
+        }
+        #connectButton:hover:not(:disabled) {
+            background-color: #0056b3;
+        }
+        #status {
+            margin-top: 15px;
+            color: #555;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Python YOLOv8 WebRTC Stream</h1>
+
+    <div id="video-container">
+        <video id="video" autoplay playsinline></video>
+    </div>
+
+    <div id="controls">
+        <button id="connectButton">Connect</button>
+        <p>Status: <span id="status">Idle</span></p>
+    </div>
+
+<script>
+    const connectButton = document.getElementById('connectButton');
+    const videoElement = document.getElementById('video');
+    const statusElement = document.getElementById('status');
+
+    const signalingServerUrl = "wss://websockettest-eggy.onrender.com";
+    let peerConnection;
+    let websocket;
+
+    // Google's public STUN servers. Helps with NAT traversal.
+    const configuration = {
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    };
+
+    connectButton.onclick = startConnection;
+
+    async function startConnection() {
+        console.log("Starting connection...");
+        statusElement.textContent = "Connecting...";
+        connectButton.disabled = true;
+
+        // 1. Create a new RTCPeerConnection
+        peerConnection = new RTCPeerConnection(configuration);
+        console.log("RTCPeerConnection created.");
+
+        // 2. Set up event handlers for the peer connection
+        setupPeerConnectionEvents();
+        
+        // 3. Connect to the signaling server via WebSocket
+        connectToSignalingServer();
+    }
+
+    function setupPeerConnectionEvents() {
+        // Event handler for when a new ICE candidate is generated
+        peerConnection.onicecandidate = event => {
+            if (event.candidate && websocket && websocket.readyState === WebSocket.OPEN) {
+                console.log("Generated ICE candidate:", event.candidate.candidate);
+                const candidateMessage = "CANDIDATE!" + JSON.stringify({
+                    SdpMid: event.candidate.sdpMid,
+                    SdpMLineIndex: event.candidate.sdpMLineIndex,
+                    Candidate: event.candidate.candidate
+                });
+                websocket.send(candidateMessage);
+            }
+        };
+
+        // Event handler for when a remote media track is added
+        peerConnection.ontrack = event => {
+            console.log("Remote track received:", event.track.kind);
+            if (event.streams && event.streams[0]) {
+                videoElement.srcObject = event.streams[0];
+                statusElement.textContent = "Stream Connected!";
+            }
+        };
+
+        // Event handler for ICE connection state changes (for debugging)
+        peerConnection.oniceconnectionstatechange = () => {
+            console.log(`ICE Connection State: ${peerConnection.iceConnectionState}`);
+            statusElement.textContent = `ICE State: ${peerConnection.iceConnectionState}`;
+            if(peerConnection.iceConnectionState === 'failed' || peerConnection.iceConnectionState === 'disconnected' || peerConnection.iceConnectionState === 'closed') {
+                connectButton.disabled = false;
+            }
+        };
+    }
+
+    function connectToSignalingServer() {
+        websocket = new WebSocket(signalingServerUrl);
+
+        // When the WebSocket connection opens, create and send the offer
+        websocket.onopen = async () => {
+            console.log("WebSocket connected to signaling server.");
+            statusElement.textContent = "Creating Offer...";
+            
+            // Create an offer to receive 1 video track
+            const offer = await peerConnection.createOffer({
+                offerToReceiveVideo: 1,
+            });
+            await peerConnection.setLocalDescription(offer);
+
+            // Send the offer to the Python peer via the signaling server
+            const offerMessage = "OFFER!" + JSON.stringify({
+                Sdp: peerConnection.localDescription.sdp,
+                SessionType: peerConnection.localDescription.type.charAt(0).toUpperCase() + peerConnection.localDescription.type.slice(1)
+            });
+
+            console.log("Sending offer...");
+            websocket.send(offerMessage);
+            statusElement.textContent = "Offer sent, waiting for answer...";
+        };
+
+        // Handle incoming messages from the signaling server
+        websocket.onmessage = async (event) => {
+            const message = event.data;
+
+            if (message.startsWith("ANSWER!")) {
+                console.log("Received answer from Python peer.");
+                const answerData = JSON.parse(message.substring("ANSWER!".length));
+                const answer = new RTCSessionDescription({
+                    type: answerData.SessionType.toLowerCase(),
+                    sdp: answerData.Sdp
+                });
+                await peerConnection.setRemoteDescription(answer);
+                console.log("Set remote description (answer).");
+                statusElement.textContent = "Answer received, establishing connection...";
+
+            } else if (message.startsWith("CANDIDATE!")) {
+                console.log("Received ICE candidate from Python peer.");
+                const candidateData = JSON.parse(message.substring("CANDIDATE!".length));
+                const candidate = new RTCIceCandidate({
+                    sdpMid: candidateData.SdpMid,
+                    sdpMLineIndex: candidateData.SdpMLineIndex,
+                    candidate: candidateData.Candidate
+                });
+                await peerConnection.addIceCandidate(candidate);
+                console.log("Added remote ICE candidate.");
+            }
+        };
+
+        websocket.onclose = () => {
+            console.log("WebSocket connection closed.");
+            statusElement.textContent = "Disconnected from signaling server.";
+            connectButton.disabled = false;
+        };
+
+        websocket.onerror = (error) => {
+            console.error("WebSocket error:", error);
+            statusElement.textContent = "WebSocket error!";
+            connectButton.disabled = false;
+        };
+    }
+</script>
+
+</body>
+</html>
