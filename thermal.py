@@ -235,17 +235,41 @@ class CalibratedHumanDetector:
         else:
             return "LIKELY DEAD" if max_temp <= self.TEMP_THRESHOLDS['dead_threshold'] else "UNKNOWN", confidence
 
-class ThermalVideoStreamTrack(VideoStreamTrack):
-    """Thermal camera video stream with data sharing"""
+class CombinedCameraStreamTrack(VideoStreamTrack):
+    """
+    A single video track that combines RGB and Thermal camera feeds side-by-side.
+    """
     def __init__(self, thermal_buffer: ThermalDataBuffer):
         super().__init__()
-        self.width = 320
-        self.height = 240
         self.thermal_buffer = thermal_buffer
-        self.frame_interval = 1.0 / 8  # 8 FPS
+        self.rgb_width, self.rgb_height = 320, 240
+        self.width, self.height = self.rgb_width * 2, self.rgb_height # Combined view
+        
+        self.frame_interval = 1.0 / 15  # Target 15 FPS
         self.last_frame_time = 0
+        self.frame_counter = 0
+
+        # Initialize components
+        self.calibrator = DualCameraCalibrator()
+        self.detector = CalibratedHumanDetector(self.calibrator)
+        
+        # Initialize cameras
         self._initialize_thermal_camera()
-        logger.info("✅ Thermal camera track initialized")
+        self._initialize_rgb_camera()
+        
+        # Load YOLO Model
+        try:
+            self.model = YOLO("yolov8n.pt")
+            logger.info("✅ YOLO model loaded")
+        except Exception as e:
+            logger.error(f"Fatal: YOLO load failed: {e}")
+            raise
+
+        # Caching for smoother rendering
+        self.last_results = None
+        self.last_analyses = []
+        
+        logger.info("✅ Combined camera track initialized")
 
     def _initialize_thermal_camera(self):
         """Initialize MLX90640 thermal camera"""
@@ -254,7 +278,7 @@ class ThermalVideoStreamTrack(VideoStreamTrack):
                 self.i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
                 self.mlx = adafruit_mlx90640.MLX90640(self.i2c)
                 self.mlx.refresh_rate = adafruit_mlx90640.RefreshRate.REFRESH_8_HZ
-                self.thermal_frame = np.zeros((24 * 32,), dtype=float)
+                self.thermal_frame_data = np.zeros((24 * 32,), dtype=float)
                 logger.info(f"Thermal camera ready (attempt {attempt + 1})")
                 return
             except Exception as e:
@@ -262,109 +286,8 @@ class ThermalVideoStreamTrack(VideoStreamTrack):
                 time.sleep(0.5)
         raise IOError("Cannot initialize thermal camera")
 
-    def get_thermal_data(self) -> Optional[np.ndarray]:
-        """Get raw thermal data"""
-        try:
-            self.mlx.getFrame(self.thermal_frame)
-            return np.array(self.thermal_frame).reshape((24, 32))
-        except Exception as e:
-            logger.error(f"Thermal data read error: {e}")
-            return None
-
-    def thermal_to_colormap(self, thermal_data: np.ndarray) -> np.ndarray:
-        """Convert thermal data to color image"""
-        vmin, vmax = 20.0, 50.0
-        scaled = np.clip((thermal_data - vmin) / (vmax - vmin), 0, 1)
-        thermal_8bit = (scaled * 255).astype(np.uint8)
-        thermal_resized = cv2.resize(thermal_8bit, (self.width, self.height), 
-                                    interpolation=cv2.INTER_NEAREST)
-        return cv2.applyColorMap(thermal_resized, cv2.COLORMAP_INFERNO)
-
-    async def recv(self):
-        """Receive thermal video frame"""
-        try:
-            # Frame rate control
-            current_time = time.time()
-            if current_time - self.last_frame_time < self.frame_interval:
-                await asyncio.sleep(self.frame_interval - (current_time - self.last_frame_time))
-            self.last_frame_time = time.time()
-            
-            pts, time_base = await self.next_timestamp()
-            
-            # Get thermal data
-            thermal_data = self.get_thermal_data()
-            
-            if thermal_data is not None:
-                # Update shared buffer for RGB camera
-                self.thermal_buffer.update(thermal_data)
-                
-                # Create display frame
-                frame = self.thermal_to_colormap(thermal_data)
-                
-                # Add overlays
-                avg_temp = np.mean(thermal_data)
-                min_temp = np.min(thermal_data)
-                max_temp = np.max(thermal_data)
-                
-                cv2.putText(frame, "THERMAL", (10, 25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(frame, f"Avg:{avg_temp:.1f}C", (10, 50), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, f"Max:{max_temp:.1f}C", (10, 70), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                cv2.rectangle(frame, (0, 0), (self.width-1, self.height-1), (0, 165, 255), 2)
-            else:
-                frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-                cv2.putText(frame, "NO THERMAL DATA", (10, 120), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            
-            # Convert and return
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            video_frame = VideoFrame.from_ndarray(frame, format="rgb24")
-            video_frame.pts = pts
-            video_frame.time_base = time_base
-            return video_frame
-            
-        except Exception as e:
-            logger.error(f"Thermal recv error: {e}")
-            frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            video_frame = VideoFrame.from_ndarray(frame, format="rgb24")
-            video_frame.pts = pts
-            video_frame.time_base = time_base
-            return video_frame
-
-class CameraVideoStreamTrack(VideoStreamTrack):
-    """RGB camera with integrated thermal analysis"""
-    def __init__(self, thermal_buffer: ThermalDataBuffer):
-        super().__init__()
-        self.width = 320
-        self.height = 240
-        self.thermal_buffer = thermal_buffer
-        self.frame_interval = 1.0 / 15  # 15 FPS
-        self.last_frame_time = 0
-        self.frame_counter = 0
-        
-        # Initialize components
-        self.calibrator = DualCameraCalibrator()
-        self.detector = CalibratedHumanDetector(self.calibrator)
-        self._initialize_camera()
-        
-        # Load YOLO
-        try:
-            self.model = YOLO("yolov8n.pt")
-            logger.info("✅ YOLO model loaded")
-        except Exception as e:
-            logger.error(f"YOLO load failed: {e}")
-            raise
-        
-        # Cache
-        self.last_results = None
-        self.last_analyses = []
-        
-        logger.info("✅ RGB camera track initialized")
-
-    def _initialize_camera(self):
-        """Initialize camera"""
+    def _initialize_rgb_camera(self):
+        """Initialize RGB camera"""
         for attempt in range(3):
             try:
                 if hasattr(self, 'cap') and self.cap:
@@ -373,7 +296,7 @@ class CameraVideoStreamTrack(VideoStreamTrack):
                 
                 pipeline = (
                     f"libcamerasrc ! "
-                    f"video/x-raw,width={self.width},height={self.height},format=YUY2,framerate=15/1 ! "
+                    f"video/x-raw,width={self.rgb_width},height={self.rgb_height},format=YUY2,framerate=15/1 ! "
                     f"queue max-size-buffers=1 leaky=downstream ! "
                     f"videoconvert ! video/x-raw,format=BGR ! "
                     f"appsink sync=false drop=true max-buffers=1"
@@ -399,90 +322,120 @@ class CameraVideoStreamTrack(VideoStreamTrack):
         self.cleanup()
 
     async def recv(self):
-        """Receive RGB video frame with thermal analysis"""
+        """Receive a combined RGB and Thermal video frame"""
         try:
-            # Frame rate control
             current_time = time.time()
             if current_time - self.last_frame_time < self.frame_interval:
                 await asyncio.sleep(self.frame_interval - (current_time - self.last_frame_time))
             self.last_frame_time = time.time()
-            
+
             pts, time_base = await self.next_timestamp()
-            
-            # Read frame
+
+            # --- Process Thermal Frame ---
+            thermal_display_frame = self._get_thermal_display_frame()
+
+            # --- Process RGB Frame ---
             if not self.cap or not self.cap.isOpened():
                 logger.warning("Camera disconnected, reinitializing...")
-                self._initialize_camera()
+                self._initialize_rgb_camera()
             
-            ret, frame = self.cap.read()
+            ret, rgb_frame = self.cap.read()
             if not ret:
-                logger.error("Failed to read frame")
-                frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-                cv2.rectangle(frame, (50, 50), (100, 100), (0, 0, 255), -1)
+                logger.error("Failed to read RGB frame")
+                rgb_frame = np.zeros((self.rgb_height, self.rgb_width, 3), dtype=np.uint8)
+                cv2.putText(rgb_frame, "NO RGB DATA", (80, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             else:
-                frame = self._process_frame(frame)
+                rgb_frame = self._process_rgb_frame(rgb_frame)
+
+            # --- Combine Frames ---
+            combined_frame = cv2.hconcat([rgb_frame, thermal_display_frame])
             
-            # Convert and return
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            video_frame = VideoFrame.from_ndarray(frame, format="rgb24")
-            video_frame.pts = pts
-            video_frame.time_base = time_base
-            return video_frame
-            
-        except Exception as e:
-            logger.error(f"RGB recv error: {e}")
-            frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            video_frame = VideoFrame.from_ndarray(frame, format="rgb24")
+            # Convert and return the final frame
+            video_frame = VideoFrame.from_ndarray(combined_frame, format="bgr24")
             video_frame.pts = pts
             video_frame.time_base = time_base
             return video_frame
 
-    def _process_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Process frame with YOLO and thermal analysis"""
+        except Exception as e:
+            logger.error(f"Combined recv error: {e}")
+            frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
+            video_frame.pts = pts
+            video_frame.time_base = time_base
+            return video_frame
+
+    def _get_thermal_raw_data(self) -> Optional[np.ndarray]:
+        """Get raw thermal data from the sensor"""
+        try:
+            self.mlx.getFrame(self.thermal_frame_data)
+            data = np.array(self.thermal_frame_data).reshape((24, 32))
+            self.thermal_buffer.update(data) # Update shared buffer
+            return data
+        except Exception as e:
+            logger.error(f"Thermal data read error: {e}")
+            self.thermal_buffer.update(None)
+            return None
+
+    def _get_thermal_display_frame(self) -> np.ndarray:
+        """Create the visual frame for the thermal camera"""
+        thermal_data = self._get_thermal_raw_data()
+        
+        if thermal_data is not None:
+            vmin, vmax = 20.0, 50.0
+            scaled = np.clip((thermal_data - vmin) / (vmax - vmin), 0, 1)
+            thermal_8bit = (scaled * 255).astype(np.uint8)
+            thermal_resized = cv2.resize(thermal_8bit, (self.rgb_width, self.rgb_height), interpolation=cv2.INTER_NEAREST)
+            frame = cv2.applyColorMap(thermal_resized, cv2.COLORMAP_INFERNO)
+            
+            # Add overlays
+            avg_temp, min_temp, max_temp = np.mean(thermal_data), np.min(thermal_data), np.max(thermal_data)
+            cv2.putText(frame, "THERMAL", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame, f"Avg:{avg_temp:.1f}C", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, f"Max:{max_temp:.1f}C", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.rectangle(frame, (0, 0), (self.rgb_width - 1, self.rgb_height - 1), (0, 165, 255), 2)
+        else:
+            frame = np.zeros((self.rgb_height, self.rgb_width, 3), dtype=np.uint8)
+            cv2.putText(frame, "NO THERMAL DATA", (50, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        return frame
+
+    def _process_rgb_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Process RGB frame with YOLO and thermal analysis"""
         self.frame_counter += 1
         
-        # Run YOLO every 3 frames
+        # Run YOLO inference every 3 frames for efficiency
         if self.frame_counter % 3 == 0:
             self.last_results = self.model(frame, verbose=False, imgsz=320, conf=0.5)[0]
             
-            # Get thermal data (check if fresh)
             thermal_data = None
-            thermal_age = self.thermal_buffer.get_age()
-            if thermal_age < 1.0:  # Use thermal data if less than 1 second old
+            if self.thermal_buffer.get_age() < 1.0: # Use fresh thermal data
                 thermal_data = self.thermal_buffer.get()
             
-            # Analyze humans with thermal
             self.last_analyses = self.detector.analyze_humans(self.last_results, thermal_data)
         
-        # Draw results
+        # Draw results onto the frame
         return self._draw_results(frame)
-    
-    def _draw_results(self, frame: np.ndarray) -> np.ndarray:
-        """Draw detection results on frame"""
+def _draw_results(self, frame: np.ndarray) -> np.ndarray:
+        """Draw detection results on the RGB frame"""
         alive, dead, uncertain = 0, 0, 0
         
-        # Draw human detections with thermal analysis
         for analysis in self.last_analyses:
             x1, y1, x2, y2 = analysis['rgb_bbox']
-            status = analysis['status']
-            conf = analysis['confidence']
-            temp = analysis['max_temp']
+            status, conf, temp = analysis['status'], analysis['confidence'], analysis['max_temp']
             
-            # Color based on status
+            color = (0, 255, 255) # Default: Yellow for uncertain
             if "ALIVE" in status:
                 color, alive = (0, 255, 0), alive + 1
             elif "DEAD" in status:
                 color, dead = (0, 0, 255), dead + 1
             else:
-                color, uncertain = (0, 255, 255), uncertain + 1
+                uncertain += 1
             
-            # Draw bbox and info
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, status, (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            cv2.putText(frame, f"{temp}C", (x1, y1-15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            cv2.putText(frame, f"C:{conf:.2f}", (x1, y1-2), cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
+            cv2.putText(frame, status, (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(frame, f"{temp:.1f}C", (x1, y1 - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(frame, f"C:{conf:.2f}", (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
         
-        # Draw other objects (chairs, tables)
         if self.last_results:
             for box in self.last_results.boxes.data:
                 cls = int(box[5])
@@ -490,27 +443,22 @@ class CameraVideoStreamTrack(VideoStreamTrack):
                     x1, y1, x2, y2 = map(int, box[:4])
                     label = "chair" if cls == 56 else "table"
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 128, 255), 2)
-                    cv2.putText(frame, label, (x1, y1-10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 128, 255), 1)
+                    cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 128, 255), 1)
         
         # Status overlay
         thermal_age = self.thermal_buffer.get_age()
         calib_status = "Calibrated" if self.calibrator.homography_matrix is not None else "Scaling"
         thermal_status = f"Fresh" if thermal_age < 1.0 else f"Stale({thermal_age:.1f}s)"
         
-        cv2.putText(frame, "RGB+THERMAL", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"Alive:{alive} Dead:{dead} ?:{uncertain}", (10, 45), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, f"{calib_status}|{thermal_status}", (10, 65), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(frame, "RGB+THERMAL ANALYSIS", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        cv2.putText(frame, f"Alive:{alive} Dead:{dead} ?:{uncertain}", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, f"Calib:{calib_status} | Thermal:{thermal_status}", (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
         
-        # Border
-        cv2.rectangle(frame, (0, 0), (self.width-1, self.height-1), (0, 255, 0), 2)
-        
+        cv2.rectangle(frame, (0, 0), (self.rgb_width - 1, self.rgb_height - 1), (0, 255, 0), 2)
         return frame
 
-async def run_webrtc(offer, pc, camera_track, thermal_track):
-    """Handle WebRTC connection"""
+async def run_webrtc(offer, pc, combined_track):
+    """Handle WebRTC connection for a single combined track"""
     @pc.on("track")
     def on_track(track):
         logger.info(f"Received track: {track.kind}")
@@ -524,12 +472,8 @@ async def run_webrtc(offer, pc, camera_track, thermal_track):
         logger.info(f"Connection state: {pc.connectionState}")
 
     try:
-        if camera_track:
-            pc.addTrack(camera_track)
-            logger.info("✅ RGB track added")
-        if thermal_track:
-            pc.addTrack(thermal_track)
-            logger.info("✅ Thermal track added")
+        pc.addTrack(combined_track)
+        logger.info("✅ Combined camera track added")
 
         await pc.setRemoteDescription(RTCSessionDescription(sdp=offer, type="offer"))
         answer = await pc.createAnswer()
@@ -561,7 +505,6 @@ def parse_ice_candidate(candidate_str: str) -> Dict:
         "relatedPort": None
     }
     
-    # Parse optional raddr/rport
     i = 8
     while i < len(parts):
         if parts[i] == "raddr" and i + 1 < len(parts):
@@ -581,40 +524,28 @@ async def main():
     peer_id = "python-peer"
     
     print("="*50)
-    print("THERMAL-RGB HUMAN DETECTION SYSTEM")
+    print("THERMAL-RGB HUMAN DETECTION SYSTEM (SIDE-BY-SIDE)")
     print("="*50)
     
-    # Create shared thermal buffer
     thermal_buffer = ThermalDataBuffer()
     
-    while True:  # Reconnection loop
+    while True:
         websocket = None
         pc = None
-        camera_track = None
-        thermal_track = None
+        combined_track = None
         
         try:
             pc = RTCPeerConnection()
             
-            # Initialize thermal camera first
             try:
-                thermal_track = ThermalVideoStreamTrack(thermal_buffer)
+                combined_track = CombinedCameraStreamTrack(thermal_buffer)
             except Exception as e:
-                logger.error(f"❌ Thermal camera failed: {e}")
+                logger.error(f"❌ Failed to initialize combined camera track: {e}")
                 await asyncio.sleep(5)
                 continue
             
-            # Initialize RGB camera
-            try:
-                camera_track = CameraVideoStreamTrack(thermal_buffer)
-            except Exception as e:
-                logger.error(f"❌ RGB camera failed: {e}")
-                await asyncio.sleep(5)
-                continue
+            logger.info("✅ Camera systems initialized")
             
-            logger.info("✅ Both cameras initialized")
-            
-            # WebRTC handlers
             @pc.on("icecandidate")
             async def on_ice_candidate(candidate):
                 if candidate and websocket and not websocket.closed:
@@ -625,17 +556,14 @@ async def main():
                     }
                     await websocket.send("CANDIDATE!" + json.dumps(msg))
             
-            # Connect to signaling server
             async with websockets.connect(uri) as ws:
                 websocket = ws
                 logger.info(f"✅ Connected to {uri}")
                 
-                # Register
                 await websocket.send(json.dumps({"type": "register", "peer_id": peer_id}))
                 await websocket.send(json.dumps({"type": "peer_connected", "peer_id": peer_id}))
                 logger.info("✅ Registered as python-peer")
                 
-                # Message loop
                 while True:
                     try:
                         message = await websocket.recv()
@@ -644,7 +572,7 @@ async def main():
                         if message.startswith("OFFER!"):
                             data = json.loads(message[6:])
                             logger.info("📨 Received offer")
-                            answer = await run_webrtc(data["Sdp"], pc, camera_track, thermal_track)
+                            answer = await run_webrtc(data["Sdp"], pc, combined_track)
                             if answer:
                                 await websocket.send("ANSWER!" + json.dumps({
                                     "SessionType": answer.type.capitalize(),
@@ -656,17 +584,11 @@ async def main():
                             data = json.loads(message[10:])
                             parsed = parse_ice_candidate(data["Candidate"])
                             candidate = RTCIceCandidate(
-                                foundation=parsed["foundation"],
-                                component=parsed["component"],
-                                protocol=parsed["protocol"],
-                                priority=parsed["priority"],
-                                ip=parsed["ip"],
-                                port=parsed["port"],
-                                type=parsed["type"],
-                                sdpMid=data["SdpMid"],
-                                sdpMLineIndex=data["SdpMLineIndex"],
-                                relatedAddress=parsed["relatedAddress"],
-                                relatedPort=parsed["relatedPort"]
+                                foundation=parsed["foundation"], component=parsed["component"],
+                                protocol=parsed["protocol"], priority=parsed["priority"],
+                                ip=parsed["ip"], port=parsed["port"], type=parsed["type"],
+                                sdpMid=data["SdpMid"], sdpMLineIndex=data["SdpMLineIndex"],
+                                relatedAddress=parsed["relatedAddress"], relatedPort=parsed["relatedPort"]
                             )
                             await pc.addIceCandidate(candidate)
                             logger.debug("Added ICE candidate")
@@ -675,11 +597,8 @@ async def main():
                             logger.info("Received bye")
                             break
                     
-                    except websockets.ConnectionClosedOK:
-                        logger.info("WebSocket closed gracefully")
-                        break
-                    except websockets.ConnectionClosedError as e:
-                        logger.error(f"WebSocket closed with error: {e}")
+                    except websockets.ConnectionClosed:
+                        logger.info("WebSocket closed")
                         break
                     except Exception as e:
                         logger.error(f"Message handling error: {e}")
@@ -688,9 +607,8 @@ async def main():
         except Exception as e:
             logger.error(f"Main loop error: {e}")
         finally:
-            # Cleanup
-            if camera_track:
-                camera_track.cleanup()
+            if combined_track:
+                combined_track.cleanup()
             if pc and pc.connectionState != "closed":
                 await pc.close()
             if websocket:
